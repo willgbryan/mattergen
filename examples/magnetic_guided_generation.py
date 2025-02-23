@@ -15,6 +15,7 @@ from chgnet.model.model import CHGNet
 from mattergen.generator import CrystalGenerator
 from mattergen.diffusion.sampling.reward_functions import MagneticRewardFunction
 from mattergen.utils.magnetic_guidance import create_property_guided_generator
+from mattergen.common.utils.data_classes import MatterGenCheckpointInfo
 
 def main():
     # Configuration
@@ -34,10 +35,10 @@ def main():
     
     # Create base MatterGen generator
     generator = CrystalGenerator(
-        pretrained_name="mattergen_base",  # Use pre-trained base model
+        checkpoint_info=MatterGenCheckpointInfo.from_hf_hub("mattergen_base"),
         batch_size=BATCH_SIZE,
         num_batches=NUM_BATCHES,
-        record_trajectories=True  # Record the denoising trajectory
+        record_trajectories=True
     )
     
     print(f"Creating magnetically-guided generator (target moment: {TARGET_MAGNETIC_MOMENT} μB)...")
@@ -55,10 +56,7 @@ def main():
     print("Generating structures...")
     
     # Generate structures
-    guided_generator.generate(
-        results_path=RESULTS_PATH,
-        save_trajectories=True
-    )
+    guided_generator.generate(output_dir=RESULTS_PATH)
     
     print("\nEvaluating generated structures...")
     
