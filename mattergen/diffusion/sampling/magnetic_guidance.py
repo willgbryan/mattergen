@@ -1,7 +1,7 @@
 import torch
 from typing import Optional
 from mattergen.diffusion.sampling.classifier_free_guidance import GuidedPredictorCorrector
-from mattergen.diffusion.sampling.pc_sampler import BatchTransform
+from mattergen.diffusion.sampling.classifier_free_guidance import BatchTransform
 from mattergen.diffusion.sampling.reward_functions import BaseRewardFunction
 
 class PropertyGuidedPredictorCorrector(GuidedPredictorCorrector):

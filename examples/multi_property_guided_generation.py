@@ -18,6 +18,7 @@ from mattergen.diffusion.sampling.reward_functions import (
     CompositeRewardFunction
 )
 from mattergen.utils.magnetic_guidance import create_property_guided_generator
+from mattergen.common.utils.data_classes import MatterGenCheckpointInfo
 
 class StabilityRewardFunction(BaseRewardFunction):
     """Example reward function for stability using formation energy."""
@@ -83,7 +84,7 @@ def main():
     
     # Create base generator
     generator = CrystalGenerator(
-        pretrained_name="mattergen_base",
+        checkpoint_info=MatterGenCheckpointInfo.from_hf_hub("mattergen_base"),
         batch_size=BATCH_SIZE,
         num_batches=NUM_BATCHES,
         record_trajectories=True
@@ -94,21 +95,23 @@ def main():
     print(f"- Max formation energy: {MAX_FORMATION_ENERGY} eV/atom")
     print(f"- Reward weights: {REWARD_WEIGHTS}")
     
+    # Create composite reward function
+    composite_reward = CompositeRewardFunction(
+        reward_functions=reward_functions,
+        weights=REWARD_WEIGHTS
+    )
+    
     # Add multi-property guidance
     guided_generator = create_property_guided_generator(
         generator=generator,
-        reward_function=reward_functions,
-        reward_weights=REWARD_WEIGHTS,
+        reward_function=composite_reward,
         guidance_scale=GUIDANCE_SCALE
     )
     
     print("\nGenerating structures...")
     
     # Generate structures
-    guided_generator.generate(
-        results_path=RESULTS_PATH,
-        save_trajectories=True
-    )
+    guided_generator.generate(output_dir=RESULTS_PATH)
     
     print("\nEvaluating generated structures...")
     

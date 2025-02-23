@@ -6,6 +6,13 @@ from mattergen.diffusion.sampling.reward_functions import (
     MagneticRewardFunction,
     CompositeRewardFunction
 )
+from mattergen.property_embeddings import SetUnconditionalEmbeddingType, SetConditionalEmbeddingType
+from mattergen.diffusion.wrapped.wrapped_predictors_correctors import (
+    WrappedAncestralSamplingPredictor,
+    WrappedLangevinCorrector
+)
+from mattergen.diffusion.d3pm.d3pm_predictors_correctors import D3PMAncestralSamplingPredictor
+from mattergen.common.diffusion.predictors_correctors import LatticeAncestralSamplingPredictor
 
 def create_property_guided_generator(
     generator: CrystalGenerator,
@@ -41,14 +48,22 @@ def create_property_guided_generator(
     sampler = PropertyGuidedPredictorCorrector(
         guidance_scale=guidance_scale,
         reward_function=reward_function,
-        remove_conditioning_fn=cfg.sampler.remove_conditioning_fn,
-        keep_conditioning_fn=cfg.sampler.keep_conditioning_fn,
-        diffusion_module=cfg.sampler.diffusion_module,
-        predictor_partials=cfg.sampler.predictor_partials,
-        corrector_partials=cfg.sampler.corrector_partials,
-        device=cfg.sampler.device,
-        n_steps_corrector=cfg.sampler.n_steps_corrector,
-        N=cfg.sampler.N,
+        diffusion_module=generator.model.diffusion_module,
+        predictor_partials={
+            'pos': lambda corruption, score_fn: WrappedAncestralSamplingPredictor(corruption=corruption, score_fn=score_fn),
+            'cell': lambda corruption, score_fn: LatticeAncestralSamplingPredictor(corruption=corruption, score_fn=score_fn),
+            'atomic_numbers': lambda corruption, score_fn: D3PMAncestralSamplingPredictor(corruption=corruption, score_fn=score_fn, predict_x0=True)
+        },
+        corrector_partials={
+            'pos': lambda corruption, n_steps, score_fn: WrappedLangevinCorrector(corruption=corruption, score_fn=score_fn, n_steps=n_steps, max_step_size=1e6, snr=0.4),
+            'cell': lambda corruption, n_steps, score_fn: LatticeAncestralSamplingPredictor(corruption=corruption, score_fn=score_fn)
+        },
+        device=generator.model.device,
+        n_steps_corrector=10,
+        N=1000,
+        eps_t=1e-3,
+        remove_conditioning_fn=SetUnconditionalEmbeddingType(),
+        keep_conditioning_fn=SetConditionalEmbeddingType()
     )
     
     # Update the generator's sampler
