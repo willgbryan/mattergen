@@ -10,6 +10,8 @@ This script shows how to:
 import os
 from pathlib import Path
 import torch
+import zipfile
+import tempfile
 from chgnet.model.model import CHGNet
 from mattergen.generator import CrystalGenerator
 from mattergen.diffusion.sampling.reward_functions import (
@@ -20,8 +22,69 @@ from mattergen.diffusion.sampling.reward_functions import (
 from mattergen.utils.magnetic_guidance import create_property_guided_generator
 from mattergen.common.utils.data_classes import MatterGenCheckpointInfo
 
-class StabilityRewardFunction(BaseRewardFunction):
-    """Example reward function for stability using formation energy."""
+class LoggingMagneticDensityRewardFunction(BaseRewardFunction):
+    """Magnetic density reward function with detailed logging."""
+    
+    def __init__(self, target_magnetic_density: float, chgnet_model=None):
+        """
+        Args:
+            target_magnetic_density: Target magnetic density (in μB/Å³) to guide towards
+            chgnet_model: Pre-loaded CHGNet model, will load default if None
+        """
+        from chgnet.model.model import CHGNet
+        self.target_magnetic_density = target_magnetic_density
+        self.chgnet_model = chgnet_model or CHGNet.load()
+        
+        # Constants for reward scaling
+        self.density_weight = 1.0
+        self.moment_weight = 0.3
+        self.volume_weight = 0.2
+        self.target_volume = 200.0  # Å³, reasonable target for unit cell volume
+    
+    def compute_reward(self, batch: dict) -> torch.Tensor:
+        structures = self._batch_to_structures(batch)
+        rewards = []
+        
+        print("\nComputing magnetic density rewards for batch:")
+        for i, structure in enumerate(structures):
+            prediction = self.chgnet_model.predict_structure(structure)
+            mag_moments = prediction['m']  # Per-atom array
+            mag_moment = float(sum(mag_moments))  # Total magnetic moment
+            volume = structure.volume
+            mag_density = mag_moment / volume
+            
+            # Compute multi-term reward
+            # 1. Density matching term (exponential to make it stronger near target)
+            density_reward = -torch.exp(torch.tensor(abs(mag_density - self.target_magnetic_density)))
+            
+            # 2. Moment encouragement term (using tanh for smooth scaling)
+            moment_reward = torch.tanh(torch.tensor(mag_moment / 10.0))  # Scale by 10 for reasonable tanh range
+            
+            # 3. Volume control term (quadratic with minimum at target_volume)
+            volume_diff = (volume - self.target_volume) / self.target_volume
+            volume_reward = -volume_diff * volume_diff
+            
+            # Combine rewards with weights
+            reward = (self.density_weight * density_reward + 
+                     self.moment_weight * moment_reward +
+                     self.volume_weight * volume_reward)
+            
+            print(f"  Structure {i}:")
+            print(f"    Volume: {volume:.3f} Å³")
+            print(f"    Total magnetic moment: {mag_moment:.3f} μB")
+            print(f"    Magnetic density: {mag_density:.6f} μB/Å³")
+            print(f"    Target density: {self.target_magnetic_density:.6f} μB/Å³")
+            print(f"    Density reward: {density_reward:.3f}")
+            print(f"    Moment reward: {moment_reward:.3f}")
+            print(f"    Volume reward: {volume_reward:.3f}")
+            print(f"    Total reward: {reward:.3f}")
+            
+            rewards.append(reward)
+            
+        return torch.tensor(rewards, device=batch['pos'].device)
+
+class LoggingStabilityRewardFunction(BaseRewardFunction):
+    """Example reward function for stability using formation energy with logging."""
     
     def __init__(self, max_formation_energy: float = 0.1):
         self.max_formation_energy = max_formation_energy
@@ -31,36 +94,42 @@ class StabilityRewardFunction(BaseRewardFunction):
         structures = self._batch_to_structures(batch)
         rewards = []
         
-        for structure in structures:
+        print("\nComputing stability rewards for batch:")
+        for i, structure in enumerate(structures):
             prediction = self.chgnet.predict_structure(structure)
-            # Assume formation_energy is in eV/atom
-            formation_energy = prediction['energy'] / len(structure)
+            formation_energy = prediction['e'] / len(structure)
             
             # Reward is higher for more stable structures
             # Scale to roughly match magnitude of other rewards
             reward = -5.0 * abs(formation_energy)
             if formation_energy > self.max_formation_energy:
                 reward *= 2.0  # Additional penalty for unstable structures
-                
+            
+            print(f"  Structure {i}:")
+            print(f"    Formation energy: {formation_energy:.3f} eV/atom")
+            print(f"    Max allowed: {self.max_formation_energy:.3f} eV/atom")
+            print(f"    Stability reward value: {reward:.3f}")
+            
             rewards.append(reward)
             
         return torch.tensor(rewards, device=batch['pos'].device)
 
 def main():
     # Configuration
-    RESULTS_PATH = Path("results/multi_property_guided")
+    BASE_RESULTS_PATH = Path("/teamspace/studios/this_studio/mattergen/results")
+    RESULTS_PATH = BASE_RESULTS_PATH / "multi_property_guided"
     BATCH_SIZE = 8
     NUM_BATCHES = 2
     
     # Property targets
-    TARGET_MAGNETIC_MOMENT = 2.0  # Target magnetic moment in μB
+    TARGET_MAGNETIC_DENSITY = 1.5  # Target magnetic density in μB/Å³
     MAX_FORMATION_ENERGY = 0.1  # Maximum formation energy in eV/atom
     
     # Guidance parameters
-    GUIDANCE_SCALE = 1.0
+    GUIDANCE_SCALE = 2.0  # Increased from 1.0 to give stronger guidance
     REWARD_WEIGHTS = {
-        'magnetic': 0.7,  # Prioritize magnetic properties
-        'stability': 0.3  # Secondary focus on stability
+        'magnetic': 0.8,  # Increased weight on magnetic properties
+        'stability': 0.2   # Reduced weight on stability
     }
     
     # Create results directory
@@ -71,13 +140,13 @@ def main():
     # Load CHGNet (will be shared between reward functions)
     chgnet = CHGNet.load()
     
-    # Create reward functions
+    # Create reward functions with logging
     reward_functions = {
-        'magnetic': MagneticRewardFunction(
-            target_magnetic_moment=TARGET_MAGNETIC_MOMENT,
+        'magnetic': LoggingMagneticDensityRewardFunction(
+            target_magnetic_density=TARGET_MAGNETIC_DENSITY,
             chgnet_model=chgnet
         ),
-        'stability': StabilityRewardFunction(
+        'stability': LoggingStabilityRewardFunction(
             max_formation_energy=MAX_FORMATION_ENERGY
         )
     }
@@ -91,7 +160,7 @@ def main():
     )
     
     print("Creating multi-property guided generator...")
-    print(f"- Target magnetic moment: {TARGET_MAGNETIC_MOMENT} μB")
+    print(f"- Target magnetic density: {TARGET_MAGNETIC_DENSITY} μB/Å³")
     print(f"- Max formation energy: {MAX_FORMATION_ENERGY} eV/atom")
     print(f"- Reward weights: {REWARD_WEIGHTS}")
     
@@ -115,36 +184,104 @@ def main():
     
     print("\nEvaluating generated structures...")
     
-    # Load and evaluate generated structures
-    from pymatgen.core import Structure
-    structures = [
-        Structure.from_file(f) 
-        for f in RESULTS_PATH.glob("*.cif")
-    ]
+    # Look for the zip file containing generated structures
+    zip_file = RESULTS_PATH / "generated_crystals_cif.zip"
     
-    # Compute properties
-    moments = []
-    energies = []
-    for structure in structures:
-        prediction = chgnet.predict_structure(structure)
-        moments.append(prediction['magmom'].mean())
-        energies.append(prediction['energy'] / len(structure))
+    if not zip_file.exists():
+        print(f"No zip file found at {zip_file}")
+        print("Checking alternative locations...")
+        alt_paths = [
+            BASE_RESULTS_PATH / "magnetic_guided" / "generated_crystals_cif.zip",
+            Path("results/multi_property_guided/generated_crystals_cif.zip"),
+            Path("results/magnetic_guided/generated_crystals_cif.zip")
+        ]
+        for path in alt_paths:
+            if path.exists():
+                zip_file = path
+                print(f"Found zip file at: {path}")
+                break
+        else:
+            print("No structures were generated! Check the generation process.")
+            return
     
-    # Print magnetic moment statistics
-    moments = torch.tensor(moments)
-    print("\nMagnetic Properties:")
-    print(f"Average magnetic moment: {moments.mean():.2f} μB")
-    print(f"Std of magnetic moments: {moments.std():.2f} μB")
-    print(f"Min/Max magnetic moment: {moments.min():.2f}/{moments.max():.2f} μB")
-    
-    # Print formation energy statistics
-    energies = torch.tensor(energies)
-    print("\nStability Properties:")
-    print(f"Average formation energy: {energies.mean():.3f} eV/atom")
-    print(f"Std of formation energies: {energies.std():.3f} eV/atom")
-    print(f"Min/Max formation energy: {energies.min():.3f}/{energies.max():.3f} eV/atom")
-    
-    print(f"\nResults saved to: {RESULTS_PATH}")
+    # Create a temporary directory to extract CIF files
+    with tempfile.TemporaryDirectory() as temp_dir:
+        print(f"\nExtracting CIF files from {zip_file}")
+        with zipfile.ZipFile(zip_file, 'r') as zip_ref:
+            zip_ref.extractall(temp_dir)
+        
+        # Load and evaluate extracted structures
+        from pymatgen.core import Structure
+        cif_files = list(Path(temp_dir).glob("*.cif"))
+        print(f"\nFound {len(cif_files)} CIF files")
+        
+        if not cif_files:
+            print("No structures were found in the zip file!")
+            return
+        
+        structures = []
+        for f in cif_files:
+            try:
+                structure = Structure.from_file(f)
+                structures.append(structure)
+            except Exception as e:
+                print(f"Error loading structure from {f}: {e}")
+        
+        print(f"Successfully loaded {len(structures)} structures")
+        
+        if not structures:
+            print("No valid structures were loaded! Check the CIF files.")
+            return
+        
+        # Compute properties
+        moments = []
+        densities = []
+        energies = []
+        for i, structure in enumerate(structures):
+            try:
+                prediction = chgnet.predict_structure(structure)
+                mag_moment = float(sum(prediction['m']))  # Total magnetic moment
+                volume = structure.volume
+                mag_density = mag_moment / volume
+                formation_energy = prediction['e'] / len(structure)
+                
+                moments.append(mag_moment)
+                densities.append(mag_density)
+                energies.append(formation_energy)
+                
+                print(f"\nStructure {i} final evaluation:")
+                print(f"  Volume: {volume:.3f} Å³")
+                print(f"  Total magnetic moment: {mag_moment:.3f} μB")
+                print(f"  Magnetic density: {mag_density:.6f} μB/Å³")
+                print(f"  Per-atom moments: {prediction['m']}")
+                print(f"  Formation energy: {formation_energy:.3f} eV/atom")
+            except Exception as e:
+                print(f"Error evaluating structure {i}: {e}")
+        
+        if not moments or not energies:
+            print("No valid property predictions! Check the CHGNet evaluation.")
+            return
+        
+        # Print magnetic property statistics
+        moments = torch.tensor(moments)
+        densities = torch.tensor(densities)
+        print("\nMagnetic Properties:")
+        print(f"Average magnetic moment: {moments.mean():.2f} μB")
+        print(f"Std of magnetic moments: {moments.std():.2f} μB")
+        print(f"Min/Max magnetic moment: {moments.min():.2f}/{moments.max():.2f} μB")
+        print(f"\nMagnetic Density Properties:")
+        print(f"Average magnetic density: {densities.mean():.6f} μB/Å³")
+        print(f"Std of magnetic densities: {densities.std():.6f} μB/Å³")
+        print(f"Min/Max magnetic density: {densities.min():.6f}/{densities.max():.6f} μB/Å³")
+        
+        # Print formation energy statistics
+        energies = torch.tensor(energies)
+        print("\nStability Properties:")
+        print(f"Average formation energy: {energies.mean():.3f} eV/atom")
+        print(f"Std of formation energies: {energies.std():.3f} eV/atom")
+        print(f"Min/Max formation energy: {energies.min():.3f}/{energies.max():.3f} eV/atom")
+        
+        print(f"\nResults saved to: {RESULTS_PATH}")
 
 if __name__ == "__main__":
     main()
