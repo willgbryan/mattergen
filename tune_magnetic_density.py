@@ -64,7 +64,8 @@ class ConfigurableMagneticDensityReward(BaseRewardFunction):
     
     def compute_reward(self, batch: dict) -> torch.Tensor:
         structures = self._batch_to_structures(batch)
-        rewards = []
+        pos_rewards = []  # Rewards for atomic positions
+        cell_rewards = [] # Rewards for cell parameters
         
         # Clear previous batch metrics
         self.current_rewards = []
@@ -79,42 +80,84 @@ class ConfigurableMagneticDensityReward(BaseRewardFunction):
             mag_moment = float(sum(mag_moments))  # Total magnetic moment
             volume = structure.volume
             mag_density = mag_moment / volume
+            num_atoms = len(structure)
             
-            # Compute multi-term reward
-            # 1. Density matching term (exponential)
-            density_reward = -torch.exp(torch.tensor(abs(mag_density - self.target_magnetic_density)))
+            # 1. Position-specific rewards (focus on maximizing moments)
+            # Calculate target moment needed for this volume
+            target_moment = self.target_magnetic_density * volume
+            moment_ratio = mag_moment / target_moment
             
-            # 2. Moment encouragement term (tanh)
-            moment_reward = torch.tanh(torch.tensor(mag_moment / 10.0))
+            # Simple linear reward for atomic moments
+            # Reward grows linearly with moment ratio, no early penalties
+            pos_reward = self.moment_weight * (moment_ratio - 0.1)
             
-            # 3. Volume control term (quadratic)
-            volume_diff = (volume - self.target_volume) / self.target_volume
-            volume_reward = -volume_diff * volume_diff
+            # Add small bonus for aligned moments
+            moment_signs = torch.sign(torch.tensor(mag_moments))
+            alignment_score = torch.abs(moment_signs.float().mean())
+            pos_reward += 0.2 * self.moment_weight * (alignment_score - 0.5)
             
-            # Combine rewards with weights
-            reward = (self.density_weight * density_reward + 
-                     self.moment_weight * moment_reward +
-                     self.volume_weight * volume_reward)
+            # 2. Cell-specific rewards (focus on density directly)
+            # Calculate optimal volume range based on number of atoms
+            min_vol = num_atoms * 8.0   # Minimum 8 Å³ per atom
+            max_vol = num_atoms * 20.0  # Maximum 20 Å³ per atom
+            
+            # Volume reward: quadratic within bounds, linear outside
+            if volume < min_vol:
+                vol_ratio = volume / min_vol
+                volume_reward = -self.volume_weight * (1.0 - vol_ratio)
+            elif volume > max_vol:
+                vol_ratio = volume / max_vol
+                volume_reward = -0.5 * self.volume_weight * (vol_ratio - 1.0)
+            else:
+                # Small positive reward for good volume range
+                volume_reward = 0.1 * self.volume_weight
+            
+            # Direct density reward - linear with bonus thresholds
+            density_ratio = mag_density / self.target_magnetic_density
+            density_reward = self.density_weight * density_ratio
+            
+            # Add bonuses for crossing thresholds
+            if density_ratio > 0.5:
+                density_reward *= 2.0  # Double reward above 50%
+            elif density_ratio > 0.2:
+                density_reward *= 1.5  # 50% bonus above 20%
+            elif density_ratio > 0.1:
+                density_reward *= 1.2  # 20% bonus above 10%
+            
+            # Combine cell rewards
+            cell_reward = density_reward + volume_reward
             
             # Store metrics for logging
-            self.current_rewards.append(float(reward))
+            self.current_rewards.append(float(pos_reward + cell_reward))
             self.current_densities.append(mag_density)
             self.current_moments.append(mag_moment)
             self.current_volumes.append(volume)
             
             print(f"  Structure {i}:")
             print(f"    Volume: {volume:.3f} Å³")
+            print(f"    Number of atoms: {num_atoms}")
             print(f"    Total magnetic moment: {mag_moment:.3f} μB")
+            print(f"    Target moment needed: {target_moment:.3f} μB")
+            print(f"    Moment ratio: {moment_ratio:.3f}")
             print(f"    Magnetic density: {mag_density:.6f} μB/Å³")
             print(f"    Target density: {self.target_magnetic_density:.6f} μB/Å³")
-            print(f"    Density reward: {density_reward:.3f}")
-            print(f"    Moment reward: {moment_reward:.3f}")
-            print(f"    Volume reward: {volume_reward:.3f}")
-            print(f"    Total reward: {reward:.3f}")
+            print(f"    Density ratio: {density_ratio:.3f}")
+            print(f"    Position rewards:")
+            print(f"      Moment reward: {pos_reward:.3f}")
+            print(f"    Cell rewards:")
+            print(f"      Volume reward: {volume_reward:.3f}")
+            print(f"      Density reward: {density_reward:.3f}")
+            print(f"      Total cell reward: {cell_reward:.3f}")
             
-            rewards.append(reward)
-            
-        return torch.tensor(rewards, device=batch['pos'].device)
+            pos_rewards.append(pos_reward)
+            cell_rewards.append(cell_reward)
+        
+        # Return dictionary of rewards for different components
+        rewards = {
+            'pos': torch.stack(pos_rewards),
+            'cell': torch.stack(cell_rewards)
+        }
+        return rewards
 
 def evaluate_structures(zip_file: Path, chgnet_model=None) -> dict:
     """Evaluate structures from a zip file and compute metrics."""
@@ -280,11 +323,11 @@ def main():
     
     # Parameter grid
     param_grid = {
-        'guidance_scale': [1.0, 2.0, 5.0, 10.0, 20.0],
-        'density_weight': [1.0, 2.0, 5.0, 10.0],
-        'moment_weight': [0.0, 0.3, 0.6, 1.0],
-        'volume_weight': [0.0, 0.2, 0.4],
-        'target_volume': [150.0, 200.0, 250.0]
+        'guidance_scale': [500.0, 1000.0, 2000.0],      # Much stronger guidance
+        'density_weight': [10.0, 20.0, 50.0],           # Direct density emphasis
+        'moment_weight': [50.0, 100.0, 200.0],          # Very strong moment emphasis
+        'volume_weight': [0.1],                         # Minimal volume control
+        'target_volume': [100.0]                        # Smaller target volume
     }
     
     # Create results directory
